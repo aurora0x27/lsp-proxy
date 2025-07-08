@@ -4,6 +4,8 @@ import subprocess
 import socket
 import threading
 import logging
+import queue
+import select
 from   datetime import datetime
 
 
@@ -184,85 +186,109 @@ class LSPProxy:
             bufsize=-1,
         )
 
+        stdin_queue  = queue.Queue()
+        stdout_queue = queue.Queue()
+
         if self.lsp_process is None or self.lsp_process.stdin is None:
             raise RuntimeError("LSP process or its file descriptors is not available")
 
-        # Forward the request message from editor to lsp
-        def forward_stdin(self):
+        # Collect the request message from editor to lsp
+        def read_stdin(self):
             while True:
-                header = b""
-                while not header.endswith(b"\r\n\r\n"):
-                    chunk = sys.stdin.buffer.read(1)
-                    if not chunk:
-                        return  # EOF
-                    header += chunk
-                content_length = 0
-                for line in header.split(b"\r\n"):
-                    if line.startswith(b"Content-Length:"):
-                        content_length = int(line.split(b":")[1].strip())
-                        break
-                body = sys.stdin.buffer.read(content_length) if content_length > 0 else b""
-                self.lsp_process.stdin.write(header + body)
-                self.lsp_process.stdin.flush()
-                self.logger.trace(self.format_trace(REQUEST_PROMPT, body))
+                if self.lsp_process.poll() is not None:
+                    self.logger.log(self.format_log("LSP Process exits"))
+                    break
 
-        # Forward the message from lsp to editor
-        def forward_stdout(self):
+                rlist, _, _ = select.select([sys.stdin], [], [], 1)
+                if rlist:
+                    header = b""
+                    while not header.endswith(b"\r\n\r\n"):
+                        chunk = sys.stdin.buffer.read(1)
+                        if not chunk:
+                            return  # EOF
+                        header += chunk
+                    content_length = 0
+                    for line in header.split(b"\r\n"):
+                        if line.startswith(b"Content-Length:"):
+                            content_length = int(line.split(b":")[1].strip())
+                            break
+                    body = sys.stdin.buffer.read(content_length) if content_length > 0 else b""
+                    stdin_queue.put((header, body))
+                    self.logger.log("Put message into stdin_queue")
+
+        # Collect the message from lsp to editor
+        def read_stdout(self):
             while True:
-                header = b""
-                while not header.endswith(b"\r\n\r\n"):
-                    chunk = self.lsp_process.stdout.read(1)
-                    if not chunk:
-                        break  # EOF
-                    header += chunk
+                if self.lsp_process.poll() is not None:
+                    self.logger.log(self.format_log("LSP Process exits"))
+                    break
 
-                self.logger.log(self.format_log(f"LSP sent header: `{header}`"))
-                content_length = 0
-                for line in header.split(b"\r\n"):
-                    if line.startswith(b"Content-Length"):
-                        content_length = int(line.split(b":")[1].strip())
-                        break;
-                if content_length == 0:
-                    self.logger.log(self.format_log("LSP sent empty message"))
-                    continue
-                # body = self.lsp_process.stdout.read(content_length) if content_length > 0 else b""
-                body = b""
-                remaining = content_length
-                while remaining > 0:
-                    chunk = self.lsp_process.stdout.read(remaining)
-                    if not chunk:
-                        self.logger.log(self.format_log("LSP connection closed prematurely"))
-                        break
-                    body += chunk
-                    remaining -= len(chunk)
+                rlist, _, _ = select.select([self.lsp_process.stdout], [], [], 1)
+                if rlist:
+                    header = b""
+                    while not header.endswith(b"\r\n\r\n"):
+                        chunk = self.lsp_process.stdout.read(1)
+                        if not chunk:
+                            break  # EOF
+                        header += chunk
 
-                if not body:
-                    self.logger.log(self.format_log("Reveived empty body from lsp, skipping..."))
-                    continue
-                self.logger.log(self.format_log(f"Reveived body from lsp: \n{body}"))
-                sys.stdout.write(str(header + body))
-                sys.stdout.flush()
-                self.logger.trace(self.format_trace(RESPONSE_PROMPT, body))
+                    self.logger.log(self.format_log(f"LSP sent header: `{header}`"))
+                    content_length = 0
+                    for line in header.split(b"\r\n"):
+                        if line.startswith(b"Content-Length"):
+                            content_length = int(line.split(b":")[1].strip())
+                            break;
+                    if content_length == 0:
+                        self.logger.log(self.format_log("LSP sent empty message"))
+                        continue
+                    body = b""
+                    remaining = content_length
+                    while remaining > 0:
+                        chunk = self.lsp_process.stdout.read(remaining)
+                        if not chunk:
+                            self.logger.log(self.format_log("LSP connection closed prematurely"))
+                            break
+                        body += chunk
+                        remaining -= len(chunk)
 
-        # def forward_stderr(self):
-        #     while True:
-        #         chunk = self.lsp_process.stderr.read(1)
-        #         if not chunk:
-        #             break
-        #         self.logger.error(self.format_log(f"stderr: {chunk.decode('utf-8', errors='replace')}"))
+                    if not body:
+                        self.logger.log(self.format_log("Reveived empty body from lsp, skipping..."))
+                        continue
+                    stdout_queue.put((header, body))
+                    self.logger.log("Put message into stdout_queue")
 
-        stdin_thread = threading.Thread(target=forward_stdin, args=(self,), daemon=True)
+        stdin_thread = threading.Thread(target=read_stdin, args=(self,), daemon=True)
         stdin_thread.start()
         self.logger.log(self.format_log(f"Starting to forward stdin of lsp process: {self.lsp_process.pid}..."))
-        stdout_thread = threading.Thread(target=forward_stdout, args=(self,), daemon=True)
+
+        stdout_thread = threading.Thread(target=read_stdout, args=(self,), daemon=True)
         self.logger.log(self.format_log(f"Starting to forward stdout of lsp process: {self.lsp_process.pid}..."))
         stdout_thread.start()
-        # stderr_thread = threading.Thread(target=forward_stderr, args=(self,), daemon=True)
-        self.logger.log(self.format_log(f"Starting to forward stderr of lsp process: {self.lsp_process.pid}..."))
-        stdin_thread.join()
-        stdout_thread.join()
-        # stderr_thread.join()
-        self.lsp_process.wait()
+
+        # Main loop: forward messages
+        while True:
+            try:
+                if not stdin_queue.empty():
+                    header, body = stdin_queue.get(timeout=0.1)
+                    self.lsp_process.stdin.write(header + body)
+                    self.lsp_process.stdin.flush()
+                    self.logger.trace(self.format_trace(REQUEST_PROMPT, body))
+                    self.logger.log("Forward stdin message")
+                    self.logger.log(f"Sending to LSP:\n{header + body}")
+                if not stdout_queue.empty():
+                    header, body = stdout_queue.get(timeout=0.1)
+                    sys.stdout.buffer.write(header + body)
+                    sys.stdout.buffer.flush()
+                    self.logger.trace(self.format_trace(RESPONSE_PROMPT, body))
+                    self.logger.log(f"Sending to Editor:\n{header + body}")
+                    self.logger.log("Forward stdout message")
+            except queue.Empty:
+                # No data in queue
+                pass
+        # stdin_thread.join()
+        # stdout_thread.join()
+        # # stderr_thread.join()
+        # self.lsp_process.wait()
 
     # Socket Mode:
     # Editor communicate with language server by socket
