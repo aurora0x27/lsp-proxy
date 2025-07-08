@@ -31,7 +31,6 @@ class SimpleArgs:
     def __init__(self, argv):
         self.mode = "socket"
         self.port = 19198
-        self.lsp_port = 11451
         self.log_file = "lsp-proxy.log"
         self.trace_file = "lsp-proxy.trace.log"
         self.lsp_command = []
@@ -54,12 +53,6 @@ class SimpleArgs:
                 i += 2
             elif arg.startswith("--port="):
                 self.port = argv[i][len("--port="):]
-                i += 1
-            elif arg == "--lsp-port":
-                self.lsp_port = int(argv[i + 1])
-                i += 2
-            elif arg.startswith("--lsp-port="):
-                self.lsp_port = argv[i][len("--lsp-port="):]
                 i += 1
             elif arg == "--trace-file":
                 self.trace_file = argv[i + 1]
@@ -220,7 +213,7 @@ class LSPProxy:
                     for line in header.split(b"\r\n"):
                         if line.startswith(b"Content-Length"):
                             content_length = int(line.split(b":")[1].strip())
-                            break;
+                            break
                     if content_length == 0:
                         self.logger.log(self.format_log("LSP sent empty message"))
                         continue
@@ -272,6 +265,7 @@ class LSPProxy:
     # Socket Mode:
     # Editor communicate with language server by socket
     def socket_mode(self):
+        # Start lsp process
         self.lsp_process = subprocess.Popen(
             self.args.lsp_command,
             stdin=subprocess.PIPE,
@@ -290,50 +284,121 @@ class LSPProxy:
         server.listen(5)
         print(f"LSP Proxy listening on port {self.args.port}", file=sys.stderr)
 
-        # Start lsp process
-        self.lsp_process = subprocess.Popen(
-            self.args.lsp_command,
-        )
+        # socket_queue store message to forward from editor
+        socket_queue = queue.Queue()
+        # stdout_queue store message to forward from lsp
+        stdout_queue = queue.Queue()
 
-        def handle_client(client_sock):
-            lsp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            lsp_sock.connect(("localhost", self.args.lsp_port))
-
-            # Stdin on receive  -> socket
-            # Socket on receive -> lsp_process.stdout
-            def forward_stdin(self):
-                if self.lsp_process is None or self.lsp_process.stdin is None:
-                    raise RuntimeError("LSP process or its stdin is not available")
-                
+        def read_socket(self, sock):
+            try:
                 while True:
-                    line = sys.stdin.readline()
-                    if not line:
-                        break
-                    self.log("REQUEST (Editor → LSP)", line)
-                    self.lsp_process.stdin.write(line.encode('utf-8'))
-                    self.lsp_process.stdin.flush()
+                    if self.lsp_process.poll() is not None:
+                        self.logger.log(self.format_log("LSP Process exits"))
+                        break;
+                    rlist, _, _ = select.select([sock], [], [], 1)
+                    if rlist:
+                        header = b""
+                        while not header.endswith(b"\r\n\r\n"):
+                            chunk = sock.recv(1)
+                            if not chunk:
+                                break
+                            header += chunk
+                        self.logger.log(self.format_log(f"Editor sent header: `{header}`"))
+                        content_length = 0
+                        for line in header.split(b"\r\n"):
+                            if line.startswith(b"Content-Length"):
+                                content_length = int(line.split(b":")[1].strip())
+                                break
+                        if content_length == 0:
+                            self.logger.log(self.format_log("Editor sent empty message"))
+                            continue
+                        body = sock.recv(content_length) if content_length > 0 else b""
+                        socket_queue.put((header, body, sock))
+                        self.logger.log(self.format_log("Put message into socket queue"))
+            except (ConnectionResetError, BrokenPipeError) as e:
+                self.logger.log(self.format_log(f"Client socket closed: {e}"))
+            except Exception as e:
+                self.logger.log(self.format_log(f"Unexpected error in read_socket: {e}"))
+            finally:
+                sock.close()
+                self.logger.log(self.format_log(f"Socket {sock.fileno()} closed"))
 
-            def forward(src, dst, direction):
-                while True:
-                    try:
-                        # 8kb buffer
-                        data = src.recv(8192)
-                        if not data:
+        def read_stdout(self, sock):
+            while True:
+                if self.lsp_process.poll() is not None:
+                    self.logger.log(self.format_log("LSP Process exits"))
+                    break;
+
+                rlist, _, _ = select.select([self.lsp_process.stdout], [], [], 1)
+                if rlist:
+                    header = b""
+                    while not header.endswith(b"\r\n\r\n"):
+                        chunk = self.lsp_process.stdout.read(1)
+                        if not chunk:
+                            break  # EOF
+                        header += chunk
+
+                    self.logger.log(self.format_log(f"LSP sent header: `{header}`"))
+                    content_length = 0
+                    for line in header.split(b"\r\n"):
+                        if line.startswith(b"Content-Length"):
+                            content_length = int(line.split(b":")[1].strip())
+                            break;
+                    if content_length == 0:
+                        self.logger.log(self.format_log("LSP sent empty message"))
+                        continue
+                    body = b""
+                    remaining = content_length
+                    while remaining > 0:
+                        chunk = self.lsp_process.stdout.read(remaining)
+                        if not chunk:
+                            self.logger.log(self.format_log("LSP connection closed prematurely"))
                             break
-                        decoded = data.decode("utf-8", errors="replace")
-                        self.logger.trace(self.format_trace(direction, decoded))
-                        dst.send(data)
-                    except Exception as e:
-                        print(f"Error in {direction}: {e}", file=sys.stderr)
-                        break
+                        body += chunk
+                        remaining -= len(chunk)
 
-            threading.Thread(target=forward, args=(client_sock, lsp_sock, "REQUEST  (Editor → LSP)"), daemon=True).start()
-            threading.Thread(target=forward, args=(lsp_sock, client_sock, "RESPONSE (LSP → Editor)"), daemon=True).start()
+                    if not body:
+                        self.logger.log(self.format_log("Reveived empty body from lsp, skipping..."))
+                        continue
+                    stdout_queue.put((header, body, sock))
+                    self.logger.log("Put message into stdout_queue")
+
+        def forward_message(self):
+            while True:
+                try:
+                    if not socket_queue.empty():
+                        header, body, _ = socket_queue.get(timeout=0.1)
+                        self.lsp_process.stdin.write(header + body)
+                        self.lsp_process.stdin.flush()
+                        self.logger.trace(self.format_trace(REQUEST_PROMPT, body))
+                        self.logger.log("Forward stdin message")
+                    if not stdout_queue.empty():
+                        header, body, sock = stdout_queue.get(timeout=0.1)
+                        sock.send(header + body)
+                        self.logger.trace(self.format_trace(REQUEST_PROMPT, body))
+                        self.logger.log("Forward socket message")
+
+                except queue.Empty:
+                    pass
+
+        socket_threads = []
+        stdout_threads = []
+
+        forward_thread = threading.Thread(target=forward_message, args=(self,), daemon=True)
+        forward_thread.start()
+        self.logger.log(self.format_log(f"Starting to forward messages"))
 
         while True:
             client_sock, addr = server.accept()
-            print(f"New connection from {addr}", file=sys.stderr)
-            threading.Thread(target=handle_client, args=(client_sock,), daemon=True).start()
+            self.logger.log(self.format_log(f"New connection from socket {client_sock.fileno()}, at address: {addr}"))
+            sock_thread = threading.Thread(target=read_socket, args=(self, client_sock,), daemon=True)
+            sock_thread.start()
+            socket_threads.append(sock_thread)
+            stdout_thread = threading.Thread(target=read_stdout, args=(self, client_sock,), daemon=True)
+            stdout_thread.start()
+            stdout_threads.append(stdout_threads)
+            self.logger.log(self.format_log(f"Starting to collect message from stdout of lsp process: {self.lsp_process.pid}..."))
+
 
     def run(self):
         try:
