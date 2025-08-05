@@ -375,7 +375,7 @@ class LSPProxy:
                     if not stdout_queue.empty():
                         header, body, sock = stdout_queue.get(timeout=0.1)
                         sock.send(header + body)
-                        self.logger.trace(self.format_trace(REQUEST_PROMPT, body))
+                        self.logger.trace(self.format_trace(RESPONSE_PROMPT, body))
                         self.logger.log("Forward socket message")
 
                 except queue.Empty:
