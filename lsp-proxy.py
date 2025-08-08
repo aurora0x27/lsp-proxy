@@ -6,6 +6,7 @@ import threading
 import logging
 import queue
 import select
+import time
 from   datetime import datetime
 
 
@@ -150,20 +151,22 @@ class LSPProxy:
     def format_log(self, msg):
 
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
-        return f"[{timestamp}]: {msg}\n"
+        return f"[{timestamp}]: {msg}"
 
     def pipe_mode(self):
         self.lsp_process = subprocess.Popen(
             self.args.lsp_command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=sys.stderr,
+            stderr=subprocess.PIPE,
             text=False,
             bufsize=-1,
         )
 
         stdin_queue  = queue.Queue()
         stdout_queue = queue.Queue()
+
+        time.sleep(0.05)
 
         if self.lsp_process is None or self.lsp_process.stdin is None:
             raise RuntimeError("LSP process or its file descriptors is not available")
@@ -274,7 +277,7 @@ class LSPProxy:
             text=False,
             bufsize=-1,
         )
-
+        
         if self.lsp_process is None or self.lsp_process.stdin is None:
             raise RuntimeError("LSP process or its file decriptors is not available")
 
@@ -282,7 +285,7 @@ class LSPProxy:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind(("127.0.0.1", self.args.port))
         server.listen(5)
-        print(f"LSP Proxy listening on port {self.args.port}", file=sys.stderr)
+        self.logger.log(self.format_log(f"LSP Proxy listening on port {self.args.port}"))
 
         # socket_queue store message to forward from editor
         socket_queue = queue.Queue()
@@ -294,7 +297,7 @@ class LSPProxy:
                 while True:
                     if self.lsp_process.poll() is not None:
                         self.logger.log(self.format_log("LSP Process exits"))
-                        break;
+                        break
                     rlist, _, _ = select.select([sock], [], [], 1)
                     if rlist:
                         header = b""
@@ -303,18 +306,18 @@ class LSPProxy:
                             if not chunk:
                                 break
                             header += chunk
-                        self.logger.log(self.format_log(f"Editor sent header: `{header}`"))
+                        # self.logger.log(self.format_log(f"Editor sent header: `{header}`"))
                         content_length = 0
                         for line in header.split(b"\r\n"):
                             if line.startswith(b"Content-Length"):
                                 content_length = int(line.split(b":")[1].strip())
                                 break
                         if content_length == 0:
-                            self.logger.log(self.format_log("Editor sent empty message"))
+                            # self.logger.log(self.format_log("Editor sent empty message"))
                             continue
                         body = sock.recv(content_length) if content_length > 0 else b""
                         socket_queue.put((header, body, sock))
-                        self.logger.log(self.format_log("Put message into socket queue"))
+                        # self.logger.log(self.format_log("Put message into socket queue"))
             except (ConnectionResetError, BrokenPipeError) as e:
                 self.logger.log(self.format_log(f"Client socket closed: {e}"))
             except Exception as e:
@@ -327,7 +330,7 @@ class LSPProxy:
             while True:
                 if self.lsp_process.poll() is not None:
                     self.logger.log(self.format_log("LSP Process exits"))
-                    break;
+                    break
 
                 rlist, _, _ = select.select([self.lsp_process.stdout], [], [], 1)
                 if rlist:
@@ -338,7 +341,7 @@ class LSPProxy:
                             break  # EOF
                         header += chunk
 
-                    self.logger.log(self.format_log(f"LSP sent header: `{header}`"))
+                    # self.logger.log(self.format_log(f"LSP sent header: `{header}`"))
                     content_length = 0
                     for line in header.split(b"\r\n"):
                         if line.startswith(b"Content-Length"):
@@ -361,44 +364,70 @@ class LSPProxy:
                         self.logger.log(self.format_log("Reveived empty body from lsp, skipping..."))
                         continue
                     stdout_queue.put((header, body, sock))
-                    self.logger.log("Put message into stdout_queue")
+                    # self.logger.log("Put message into stdout_queue")
+
+        def read_stderr(self):
+            try:
+                while True:
+                    if self.lsp_process.poll() is not None:
+                        self.logger.log(self.format_log("[stderr] LSP process has exited, stopping stderr reader..."))
+                        break
+                    line = self.lsp_process.stderr.readline()
+                    if not line:
+                        break
+                    self.logger.log(self.format_log(f"[LSP stderr] {str(line.decode("utf-8", errors="replace").strip())}"))
+            except Exception as e:
+                self.logger.log(self.format_log(f"[stderr] Exception: {e}"))
 
         def forward_message(self):
             while True:
                 try:
                     if not socket_queue.empty():
-                        header, body, _ = socket_queue.get(timeout=0.1)
-                        self.lsp_process.stdin.write(header + body)
+                        msg, body, _ = socket_queue.get(timeout=0.1)
+                        self.lsp_process.stdin.write(msg + body)
                         self.lsp_process.stdin.flush()
                         self.logger.trace(self.format_trace(REQUEST_PROMPT, body))
-                        self.logger.log("Forward stdin message")
+                        # self.logger.log("Forward stdin message")
                     if not stdout_queue.empty():
-                        header, body, sock = stdout_queue.get(timeout=0.1)
-                        sock.send(header + body)
+                        msg, body, sock = stdout_queue.get(timeout=0.1)
+                        sock.send(msg + body)
                         self.logger.trace(self.format_trace(RESPONSE_PROMPT, body))
-                        self.logger.log("Forward socket message")
+                        # self.logger.log("Forward socket message")
 
                 except queue.Empty:
-                    pass
+                    continue
+                except OSError:
+                    self.logger.log(self.format_log("Cannot connect to socket, process exits"))
+                    break
 
-        socket_threads = []
-        stdout_threads = []
+        stderr_thread = threading.Thread(target=read_stderr, args=(self,), daemon=True)
+        stderr_thread.start()
+        time.sleep(0.05)
+        if self.lsp_process.poll() is not None:
+            self.logger.log(self.format_log("LSP process exited"))
+            return
+
+        self.logger.log(self.format_log(f"Starting to collect message from stdout of lsp process: {self.lsp_process.pid}..."))
 
         forward_thread = threading.Thread(target=forward_message, args=(self,), daemon=True)
         forward_thread.start()
         self.logger.log(self.format_log(f"Starting to forward messages"))
 
-        while True:
-            client_sock, addr = server.accept()
-            self.logger.log(self.format_log(f"New connection from socket {client_sock.fileno()}, at address: {addr}"))
-            sock_thread = threading.Thread(target=read_socket, args=(self, client_sock,), daemon=True)
-            sock_thread.start()
-            socket_threads.append(sock_thread)
-            stdout_thread = threading.Thread(target=read_stdout, args=(self, client_sock,), daemon=True)
-            stdout_thread.start()
-            stdout_threads.append(stdout_threads)
-            self.logger.log(self.format_log(f"Starting to collect message from stdout of lsp process: {self.lsp_process.pid}..."))
+        client_sock, addr = server.accept()
+        self.logger.log(self.format_log(f"New connection from socket {client_sock.fileno()}, at address: {addr}"))
+        sock_thread = threading.Thread(target=read_socket, args=(self, client_sock,), daemon=True)
+        sock_thread.start()
+        stdout_thread = threading.Thread(target=read_stdout, args=(self, client_sock,), daemon=True)
+        stdout_thread.start()
 
+        while True:
+            if self.lsp_process.poll() is not None:
+                self.logger.log(self.format_log("LSP process exited"))
+                break
+            if not forward_thread.is_alive() or not sock_thread.is_alive() or not stdout_thread.is_alive() or not stderr_thread.is_alive():
+                self.logger.log(self.format_log("Some threads exited"))
+                break
+            time.sleep(0.05)
 
     def run(self):
         try:
@@ -410,7 +439,7 @@ class LSPProxy:
                 print(f"Unknown mode {self.args.mode}")
                 exit(1)
         except KeyboardInterrupt:
-            print("\nShutting down...", file=sys.stderr)
+            self.logger.log(self.format_log("Shutting down..."))
         finally:
             if self.lsp_process:
                 self.lsp_process.terminate()
