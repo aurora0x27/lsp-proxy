@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from collections.abc import Sequence
 
@@ -190,6 +191,14 @@ def _validate(args: argparse.Namespace) -> None:
         # into it would corrupt the protocol stream in a way that is very hard
         # to diagnose from the editor side, so refuse instead of being clever.
         raise CommandLineError("--trace-file - is not allowed in pipe mode: stdout is the LSP channel")
+
+    if args.only is not None:
+        try:
+            args.only_pattern = re.compile(args.only)
+        except re.error as error:
+            raise CommandLineError(f"--only is not a valid regular expression: {error}") from None
+    else:
+        args.only_pattern = None
 
     if args.max_body_bytes < 0:
         raise CommandLineError("--max-body-bytes must be zero or positive")

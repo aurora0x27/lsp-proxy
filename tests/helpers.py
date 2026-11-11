@@ -118,6 +118,16 @@ class Client:
                 closable.close()
 
 
+def wait_for_file_contains(path: Path, needle: str, timeout: float = 10.0) -> None:
+    """The trace is written by its own thread, so allow it to catch up."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists() and needle in path.read_text(encoding="utf-8", errors="replace"):
+            return
+        time.sleep(0.02)
+    raise TimeoutError(f"{needle!r} never appeared in {path}")
+
+
 def wait_for_unix_socket(path: Path, timeout: float = 10.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:

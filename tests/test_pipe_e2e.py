@@ -5,7 +5,7 @@ from __future__ import annotations
 import subprocess
 import sys
 
-from helpers import ProxyUnderTest
+from helpers import ProxyUnderTest, wait_for_file_contains
 
 from lsp_proxy.framing import encode_frame
 
@@ -102,8 +102,9 @@ def test_trace_file_records_both_directions(tmp_path) -> None:
         proxy.write({"jsonrpc": "2.0", "id": 2, "method": "shutdown"})
         proxy.read()
 
+        wait_for_file_contains(tmp_path / "trace.jsonl", '"dir": "s2c"')
         trace = (tmp_path / "trace.jsonl").read_text(encoding="utf-8")
-        assert "c2s" in trace and "s2c" in trace
+        assert '"dir": "c2s"' in trace
         assert "tracing to" in proxy.stderr_text()
     finally:
         proxy.kill()

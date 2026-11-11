@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import BinaryIO
 
 from .framing import FramingError, decode_json, read_frame, write_all
-from .trace import Tracer
+from .trace import C2S, S2C, Tracer
 from .transports import Listener, TransportError, create_listener
 
 STDERR_PREFIX = "[server] "
@@ -110,9 +110,12 @@ class SocketClient:
 
 
 class Proxy:
-    def __init__(self, args, tracer: Tracer) -> None:
+    def __init__(self, args, tracer: Tracer, *, echo_events: bool = True) -> None:
         self.args = args
         self.tracer = tracer
+        # When the trace already goes to a terminal, echoing the same events on
+        # stderr would print every line twice, out of order.
+        self.echo_events = echo_events
         self.child: subprocess.Popen[bytes] | None = None
         self.listener: Listener | None = None
         self.client: StreamClient | SocketClient | None = None
@@ -294,8 +297,8 @@ class Proxy:
                 return
 
             header, body = frame
-            self.tracer.client_to_server(body)
-            self._forward_to_server(header + body)
+            delivered = self._forward_to_server(header + body)
+            self.tracer.client_to_server(body, delivered=delivered)
 
     def _pump_server_output(self) -> None:
         assert self.child is not None and self.child.stdout is not None
@@ -313,16 +316,19 @@ class Proxy:
                 break
 
             header, body = frame
-            self.tracer.server_to_client(body)
 
             client = self._current_client()
+            delivered = False
+            if client is not None:
+                delivered = client.send(header + body)
+                if not delivered:
+                    self._log(f"cannot write to {client.name}, detaching")
+                    self._drop_client(client)
+
+            self.tracer.server_to_client(body, delivered=delivered)
+
             if client is None:
                 self._note_unroutable(body)
-                continue
-
-            if not client.send(header + body):
-                self._log(f"cannot write to {client.name}, detaching")
-                self._drop_client(client)
 
     def _pump_server_stderr(self) -> None:
         assert self.child is not None and self.child.stderr is not None
@@ -336,7 +342,8 @@ class Proxy:
             # Forward it too: in pipe mode this is how the language server's
             # own diagnostics reach the editor's LSP log, and in socket mode it
             # shows up in the terminal running the proxy.
-            _stderr(STDERR_PREFIX + text + "\n")
+            if self.echo_events:
+                _stderr(STDERR_PREFIX + text + "\n")
 
     def _forward_to_server(self, data: bytes) -> bool:
         assert self.child is not None and self.child.stdin is not None
@@ -416,7 +423,8 @@ class Proxy:
 
     def _log(self, message: str) -> None:
         self.tracer.event(message)
-        _stderr(f"lsp-proxy: {message}\n")
+        if self.echo_events:
+            _stderr(f"lsp-proxy: {message}\n")
 
     def _debug(self, message: str) -> None:
         if self.args.verbose:
@@ -424,8 +432,25 @@ class Proxy:
 
 
 def run(args) -> int:
-    from .trace import open_trace_sink
+    from .trace import open_target, resolve_trace_target
 
-    stream, owns = open_trace_sink(args)
-    tracer = Tracer(stream, owns_stream=owns, max_body_bytes=args.max_body_bytes)
-    return Proxy(args, tracer).run()
+    try:
+        target = resolve_trace_target(args, mode=args.mode, stdout_is_tty=sys.stdout.isatty())
+    except ValueError as error:
+        _stderr(f"lsp-proxy: {error}\n")
+        return 2
+
+    stream, owns = open_target(target)
+    directions = frozenset({C2S, S2C}) if args.dir == "both" else frozenset({args.dir})
+
+    tracer = Tracer(
+        stream,
+        fmt=target.format,
+        color=target.color,
+        owns_stream=owns,
+        bodies=args.trace_bodies,
+        max_body_bytes=args.max_body_bytes,
+        only=args.only_pattern,
+        directions=directions,
+    )
+    return Proxy(args, tracer, echo_events=target.kind != "stdout").run()

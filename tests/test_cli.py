@@ -92,3 +92,13 @@ def test_version_exits_zero(capsys: pytest.CaptureFixture[str]) -> None:
 def test_main_reports_cli_errors_without_a_traceback(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["--stdio", "--trace-file", "-", "--", "srv"]) == 2
     assert "stdout is the LSP channel" in capsys.readouterr().err
+
+
+def test_invalid_only_regex_is_rejected() -> None:
+    with pytest.raises(CommandLineError, match="not a valid regular expression"):
+        parse_args(["--only", "(", "--", "srv"])
+
+
+def test_only_regex_is_compiled_for_the_tracer() -> None:
+    assert parse_args(["--only", "hover|completion", "--", "srv"]).only_pattern.pattern == "hover|completion"
+    assert parse_args(["--", "srv"]).only_pattern is None
