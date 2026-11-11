@@ -1,0 +1,68 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: install
+        run: uv sync --locked
+
+      - name: lint
+        run: |
+          uv run ruff check
+          uv run ruff format --check
+
+      - name: test
+        run: uv run pytest
+
+      - name: build and install like a user would
+        if: matrix.python == '3.13'
+        run: |
+          uv build
+          uv tool install --force dist/*.whl
+          export PATH="$HOME/.local/bin:$PATH"
+          lsp-proxy --version
+          lsp-proxy --help > /dev/null
+
+  release:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: check the tag matches the package version
+        run: |
+          version=$(uv run python -c "import lsp_proxy; print(lsp_proxy.__version__)")
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match package version v$version"
+            exit 1
+          fi
+
+      - name: build
+        run: uv build
+
+      - name: publish to GitHub releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --title "$GITHUB_REF_NAME"

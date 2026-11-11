@@ -3,8 +3,12 @@ attaches (and can re-attach) whenever it likes."""
 
 from __future__ import annotations
 
+import os
+import re
 import socket
 import time
+
+import pytest
 
 from helpers import ProxyUnderTest, connect_tcp, connect_unix, wait_for_unix_socket
 
@@ -175,3 +179,37 @@ def test_reused_unix_socket_path_is_claimed_when_stale(tmp_path) -> None:
         client.close()
     finally:
         proxy.stop()
+
+
+def test_port_in_use_fails_cleanly_and_reaps_the_server(tmp_path) -> None:
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen(1)
+    port = blocker.getsockname()[1]
+
+    proxy = ProxyUnderTest(["--port", str(port), "--trace-file", str(tmp_path / "trace.jsonl")])
+    try:
+        assert proxy.wait() == 1
+        assert "cannot listen" in proxy.stderr_text()
+
+        # The server was already running when the listener failed; it must not
+        # be left behind.
+        pid = int(re.search(r"server started \(pid (\d+)\)", proxy.stderr_text()).group(1))
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+    finally:
+        blocker.close()
+        proxy.kill()
+
+
+def test_a_regular_file_is_never_mistaken_for_a_stale_socket(tmp_path) -> None:
+    path = tmp_path / "not-a-socket"
+    path.write_text("someone's data", encoding="utf-8")
+
+    proxy = ProxyUnderTest(["--unix-socket", str(path), "--trace-file", str(tmp_path / "trace.jsonl")])
+    try:
+        assert proxy.wait() == 1
+        assert "is not a socket" in proxy.stderr_text()
+        assert path.read_text(encoding="utf-8") == "someone's data"
+    finally:
+        proxy.kill()

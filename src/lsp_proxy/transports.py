@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import os
 import socket
+import stat
 from dataclasses import dataclass
 
 AF_UNIX_AVAILABLE = hasattr(socket, "AF_UNIX")
@@ -57,6 +58,10 @@ def _claim_unix_path(path: str) -> None:
     """Remove a stale socket file, but never steal a live one."""
     if not os.path.exists(path):
         return
+
+    if not stat.S_ISSOCK(os.stat(path).st_mode):
+        # A regular file at this path is someone's data, not our leftover.
+        raise TransportError(f"{path} exists and is not a socket")
 
     probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:

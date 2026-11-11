@@ -134,13 +134,18 @@ class Proxy:
         try:
             self._start_child()
             self._install_signal_handlers()
-            self._start_server_pumps()
             if self.args.mode == "pipe":
+                # Attach the editor before the server pumps start, or the
+                # server's first notification would be dropped for lack of one.
                 self._start_pipe_client()
-            else:
+            self._start_server_pumps()
+            if self.args.mode == "socket":
                 self._start_listener()
         except ProxyStartupError as error:
             self._log(str(error))
+            self.stop_event.set()
+            if self.child is not None and self.child.poll() is None:
+                self._terminate_child()
             self.tracer.close()
             return 1
 

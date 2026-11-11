@@ -16,6 +16,7 @@ Design constraints that came out of real use:
 from __future__ import annotations
 
 import contextlib
+import itertools
 import json
 import os
 import queue
@@ -137,7 +138,7 @@ class Record:
     seq: int = field(default=0)
 
 
-def classify(message: dict[str, Any] | None, body: bytes) -> tuple[str, str | None, Any]:
+def classify(message: dict[str, Any] | None) -> tuple[str, str | None, Any]:
     """Return ``(kind, method, parsed)`` for one protocol body."""
     if message is None:
         return "unknown", None, None
@@ -182,7 +183,7 @@ class Tracer:
         self._thread = threading.Thread(target=self._run, name="trace", daemon=False)
         self._started = False
         self._broken = False
-        self._seq = 0
+        self._seq = itertools.count(1)
         self._client_pending: dict[int | str, tuple[str, float]] = {}
         self._server_pending: dict[int | str, tuple[str, float]] = {}
         self._pending_lock = threading.Lock()
@@ -219,7 +220,7 @@ class Tracer:
 
     def _protocol(self, direction: str, body: bytes, delivered: bool) -> None:
         message = _parse(body)
-        kind, method, parsed = classify(message, body)
+        kind, method, parsed = classify(message)
         now = time.time()
 
         record = Record(
@@ -257,8 +258,7 @@ class Tracer:
             return
         if self._broken:
             return
-        self._seq += 1
-        record.seq = self._seq
+        record.seq = next(self._seq)
         self._queue.put(record)
 
     # -- consumer side -----------------------------------------------------
@@ -329,20 +329,17 @@ class Tracer:
             return ""
 
         clipped, omitted = _clip(record.raw, self._max_body_bytes)
-        if omitted and record.parsed is None:
-            text = clipped.decode("utf-8", "replace")
-            return _indent(text + f"\n... (+{omitted} bytes)")
 
-        if self._bodies == "raw" or record.parsed is None:
+        # Anything over the limit is rendered from the clipped bytes: building
+        # the full pretty JSON of a 5 MB body only to throw it away would put
+        # real work on the writer thread.
+        if omitted or self._bodies == "raw" or record.parsed is None:
             text = clipped.decode("utf-8", "replace")
             if omitted:
                 text += f" ... (+{omitted} bytes)"
             return _indent(text)
 
-        rendered = json.dumps(record.parsed, indent=4, ensure_ascii=False)
-        if omitted:
-            rendered = rendered[: self._max_body_bytes] + f"\n... (+{omitted} bytes)"
-        return _indent(rendered)
+        return _indent(json.dumps(record.parsed, indent=4, ensure_ascii=False))
 
     def _write_jsonl(self, record: Record) -> str:
         payload: dict[str, Any] = {
