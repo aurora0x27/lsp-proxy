@@ -109,10 +109,16 @@ def encode_frame(body: bytes) -> bytes:
 def write_all(stream: BinaryIO, data: bytes) -> None:
     """Write a whole frame and flush it.
 
-    Buffered writers guarantee a full write; the flush is what makes the frame
+    ``write`` on a buffered writer writes everything, but on a raw one it may
+    accept only part of the data, so loop.  The flush is what makes the frame
     observable on the other side instead of sitting in our process.
     """
-    stream.write(data)
+    view = memoryview(data)
+    while view:
+        written = stream.write(view)
+        if written is None:
+            break
+        view = view[written:]
     stream.flush()
 
 

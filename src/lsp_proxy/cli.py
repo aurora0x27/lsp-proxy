@@ -216,11 +216,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     try:
-        parse_args(raw)
+        args = parse_args(raw)
     except CommandLineError as error:
         print(f"lsp-proxy: {error}", file=sys.stderr)
         return 2
 
-    # Wired up to the proxy core in the next commit (P1).
-    print("lsp-proxy: proxy core is not wired up in this build", file=sys.stderr)
-    return 2
+    from .proxy import run
+
+    return run(args)
