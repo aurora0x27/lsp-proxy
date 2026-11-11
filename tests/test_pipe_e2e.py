@@ -6,7 +6,6 @@ import subprocess
 import sys
 
 from helpers import ProxyUnderTest, wait_for_file_contains
-
 from lsp_proxy.framing import encode_frame
 
 

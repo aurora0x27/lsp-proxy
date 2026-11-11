@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import signal
 import socket
@@ -13,7 +14,7 @@ import time
 from pathlib import Path
 from typing import BinaryIO
 
-from .framing import FramingError, decode_json, read_frame, write_all
+from .framing import FramingError, decode_json, encode_frame, read_frame, write_all
 from .trace import C2S, S2C, Tracer
 from .transports import Listener, TransportError, create_listener
 
@@ -297,8 +298,45 @@ class Proxy:
                 return
 
             header, body = frame
+
+            if self._maybe_keep_alive(body):
+                continue
+
             delivered = self._forward_to_server(header + body)
             self.tracer.client_to_server(body, delivered=delivered)
+
+    def _maybe_keep_alive(self, body: bytes) -> bool:
+        """In --keep-alive mode, end the *session* without ending the server.
+
+        LSP has no notion of "detach": an editor that quits sends ``shutdown``
+        and ``exit``, which would take a language server we deliberately own
+        down with it.  Answering shutdown here and swallowing exit keeps the
+        process (and its caches, indexes and warm state) alive for the next
+        editor.  The cost is that a reattaching editor's ``initialize`` is
+        rejected by the server, which is documented as this mode's limitation.
+        """
+        if not self.args.keep_alive:
+            return False
+
+        message = decode_json(body)
+        if message is None:
+            return False
+
+        method = message.get("method")
+
+        if method == "exit" and "id" not in message:
+            self._log("suppressed exit from editor (--keep-alive)")
+            return True
+
+        if method == "shutdown" and "id" in message:
+            client = self._current_client()
+            reply = json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": None}).encode()
+            if client is None or not client.send(encode_frame(reply)):
+                self._log("cannot answer shutdown: no editor attached")
+            self._log("suppressed shutdown from editor (--keep-alive)")
+            return True
+
+        return False
 
     def _pump_server_output(self) -> None:
         assert self.child is not None and self.child.stdout is not None

@@ -154,6 +154,11 @@ def build_parser() -> argparse.ArgumentParser:
     trace.add_argument("--no-color", action="store_true", help="never use ANSI colors")
 
     runtime = parser.add_argument_group("runtime")
+    runtime.add_argument(
+        "--keep-alive",
+        action="store_true",
+        help="answer shutdown locally and drop exit, so the server outlives the editor (socket mode only)",
+    )
     runtime.add_argument("--exit-on-client", action="store_true", help="exit when the editor disconnects")
     runtime.add_argument(
         "--grace",
@@ -191,6 +196,11 @@ def _validate(args: argparse.Namespace) -> None:
         # into it would corrupt the protocol stream in a way that is very hard
         # to diagnose from the editor side, so refuse instead of being clever.
         raise CommandLineError("--trace-file - is not allowed in pipe mode: stdout is the LSP channel")
+
+    if args.keep_alive and args.mode == "pipe":
+        raise CommandLineError(
+            "--keep-alive is only meaningful in socket mode: in pipe mode the editor owns the server process"
+        )
 
     if args.only is not None:
         try:
